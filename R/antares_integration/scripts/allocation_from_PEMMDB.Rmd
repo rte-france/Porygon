@@ -1,0 +1,285 @@
+# Copyright (c) 2020-2022, RTE (www.rte-france.com)
+# See AUTHORS.txt
+# SPDX-License-Identifier: MPL-2.0
+# This file is part of the Porygon project.
+
+---
+title: "ERAA 2022 allocation"
+author: "Paul Plessiez"
+date: "19/04/2022"
+output:
+  html_document:
+    toc: yes
+    number_section: true
+---
+
+# Objectives
+
+The objective of this file is to allocate FB domains on the ERAA 2022 study
+based on a trained RF algorithm and the input data of the study
+
+# Setup and imports
+
+```{r setup, message=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+library(antaresRead)
+library(data.table)
+library(randomForest)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+
+```
+
+# Setting parameters
+
+```{r set_parameters}
+
+porygon_path <- "D:/Users/user/myPath/"
+rf_winter_path <- file.path(porygon_path, "R/clustering/outputs/rf_winter_2022.rds")
+rf_summer_path <- file.path(porygon_path, "R/clustering/outputs/rf_summer_2022.rds")
+clusters_path <- file.path(porygon_path, "R/clustering/outputs/clusters_ERAA_2022.RDS")
+
+load_path <- "inputs/Demand_TimeSeries_2025_NationalTrends.xlsx"
+wind_onshore_path <- "inputs/PECD_Wind_Onshore_2025_edition 2022.1.xlsx"
+wind_offshore_path <- "inputs/PECD_Wind_Onshore_2025_edition 2022.1.xlsx"
+solar_path <- "inputs/PECD_LFSolarPV_2025_edition 2022.1.xlsx"
+hydro_path <- "inputs/Hydro Inflows/"
+
+target_year <- 2025
+
+idTypDays <- data.table(
+  cluster = c("summer1", "summer2", "winter1", "winter2"),
+  idDayType = c(1:4)
+)
+
+output_path <- "outputs/allocation.csv"
+
+```
+
+
+# Loading of the RF models
+
+Here, we will load the trained RF models and retrieve the list of countries
+for which input data is needed.
+
+```{r load_rf}
+
+rf_summer <- readRDS(rf_summer_path)
+rf_winter <- readRDS(rf_winter_path)
+
+variables <- rownames(rf_winter$importance)
+areas <- unique(sapply(strsplit(variables, split = "_"), function(X){X[1]}))
+
+```
+
+
+# Retrieval and formatting of the input data
+
+Here, we will retrieve the input data and put it in the format expected
+by the RF algorithm.
+
+## Extracting load data
+```{r extract_load}
+
+load_data <- lapply(areas, function(area){
+  data <- as.data.table(
+    read.xlsx(load_path, sheet = toupper(area), startRow = 11))
+  data <- data[, 1:37]
+  data[, `:=`(area = area, time = c(1:8760))]
+}) %>% 
+  rbindlist()
+
+load_data[, `:=`(Date = NULL, Hour = NULL)]
+load_data <- melt(load_data, id.vars = c("time", "area"),
+                  variable.name = "year", value.name = "load")
+
+```
+
+## Extracting wind onshore data
+```{r extract_wind_onshore}
+
+wind_onshore_data <- lapply(areas, function(area){
+  data <- as.data.table(
+    read.xlsx(wind_onshore_path, sheet = toupper(area), startRow = 10))
+  data <- data[, 1:39]
+  data[, `:=`(area = area, time = c(1:8760))]
+}) %>% 
+  rbindlist()
+
+wind_onshore_data[, `:=`(Date = NULL, Hour = NULL)]
+wind_onshore_data <- melt(wind_onshore_data, id.vars = c("time", "area"),
+                          variable.name = "year", value.name = "wind_onshore")
+
+```
+
+## Extracting wind offshore data
+```{r extract_wind_offshore}
+
+wind_offshore_data <- lapply(areas, function(area){
+  data <- as.data.table(
+    read.xlsx(wind_offshore_path, sheet = toupper(area), startRow = 10))
+  data <- data[, 1:39]
+  data[, `:=`(area = area, time = c(1:8760))]
+}) %>% 
+  rbindlist()
+
+wind_offshore_data[, `:=`(Date = NULL, Hour = NULL)]
+wind_offshore_data <- melt(wind_offshore_data, id.vars = c("time", "area"),
+                           variable.name = "year", value.name = "wind_offshore")
+```
+
+## Extracting solar data
+```{r extract_solar}
+
+solar_data <- lapply(areas, function(area){
+  data <- as.data.table(
+    read.xlsx(solar_path, sheet = toupper(area), startRow = 10))
+  data <- data[, 1:39]
+  data[, `:=`(area = area, time = c(1:8760))]
+}) %>% 
+  rbindlist()
+
+solar_data[, `:=`(Date = NULL, Hour = NULL)]
+solar_data <- melt(solar_data, id.vars = c("time", "area"),
+                   variable.name = "year", value.name = "solar")
+```
+
+## Extracting hydro data
+```{r extract_hydro}
+
+hydro_files <- list.files(hydro_path, full.names = T)
+
+hydro_data <- lapply(areas, function(area){
+  hydro_path_area <- hydro_files[grepl(toupper(area), hydro_files) &
+                                   grepl(target_year, hydro_files)]
+  ror_data <- as.data.table(
+    read.xlsx(hydro_path_area, sheet = "Run of River", startRow = 13,
+              cols = c(18:53))) %>% 
+    .[1:365]
+  pondage_data <- as.data.table(
+    read.xlsx(hydro_path_area, sheet = "Pondage", startRow = 13,
+              cols = c(18:53))) %>% 
+    .[1:365]
+  
+  total_h_ror_data <- ror_data + pondage_data
+  total_h_ror_data <- total_h_ror_data[
+    rep(1:nrow(total_h_ror_data), each = 24)
+    ] / 24
+  total_h_ror_data[, `:=`(time = c(1:8760), area = area)]
+  
+}) %>% 
+  rbindlist()
+
+hydro_data <- melt(hydro_data, id.vars = c("time", "area"),
+                   variable.name = "year", value.name = "ror")
+
+```
+
+## Data merging
+
+We then need to merge all this input data together in one data table.
+
+```{r merge_data}
+
+all_input_data <- Reduce(function(x, y) merge(x, y,
+                                              by = c("time", "area", "year")),
+                         list(load_data, wind_onshore_data, wind_offshore_data,
+                              solar_data, hydro_data))
+
+if(nrow(all_input_data) !=
+   length(areas) * length(unique(all_input_data$year)) * 8760){
+  stop("Error during merge: unexpected final number of rows")
+}
+
+```
+
+## Formatting for RF input
+
+Finally, we transform the format of the input data to feed it to the RF model.
+
+```{r format_for_rf}
+
+input_for_rf <- melt(all_input_data,
+                     id.vars = c("area", "year", "time"),
+                     variable.name = "variable",
+                     value.name = "value") %>% 
+  .[grepl("wind|ror", variable), variable := fcase(
+    grepl("wind", variable), "wind",
+    variable == "ror", "h_ror"
+  )] %>% 
+  .[, lapply(.SD, sum), by = c("area", "year", "time", "variable")] %>% 
+  .[, column_name := paste0(area, "_", variable)] %>% 
+  dcast(formula = year+time~column_name, value.var = "value") %>% 
+  setnames(old = c("year", "time"), new = c("tsId", "timeId"))
+
+```
+
+## Normalization of the input variables
+
+```{r normalization}
+
+area_variables <- colnames(input_for_rf)[
+  grepl(paste(areas, collapse = "|"), colnames(input_for_rf))
+]
+input_for_rf[,
+                paste0(area_variables, "_normalized") := lapply(.SD, scale),
+                .SDcols = area_variables
+]
+
+cols_to_keep <- colnames(input_for_rf)[
+  grepl(paste(c("tsId", "timeId", "normalized"), collapse = "|"),
+        colnames(input_for_rf))
+  ]
+input_for_rf <- input_for_rf[, .SD, .SDcols = cols_to_keep]
+
+```
+
+
+# Random forest application
+
+Here, we apply the RF prediction for winter and summer on the retrieved input.
+The output is a table containing the typical day number to apply for each hour
+of each CY.
+
+## Application of RF for summer
+
+```{r apply_rf_summer}
+
+
+summer_days <- input_for_rf[timeId >= 2161 & timeId <= 6552]
+summer_prediction <- predict(object = rf_summer, newdata = summer_days)
+summer_days <- summer_days[, cluster := summer_prediction]
+summer_days <- merge(summer_days, idTypDays, by = "cluster") %>% 
+  .[order(tsId, timeId)]
+
+```
+
+## Application of RF for winter
+
+```{r apply_rf_winter}
+
+winter_days <- input_for_rf[timeId < 2161 | timeId > 6552]
+winter_prediction <- predict(object = rf_winter, newdata = winter_days)
+winter_days <- winter_days[, cluster := winter_prediction]
+winter_days <- merge(winter_days, idTypDays, by = "cluster") %>%
+  .[order(tsId, timeId)]
+
+```
+
+## Formatting and saving results
+
+```{r formatting_for_report}
+
+all_days <- rbind(summer_days, winter_days)
+all_days <- all_days[, .(tsId, timeId, idDayType)] %>% .[order(tsId, timeId)]
+
+all_days_reporting <- dcast(all_days,
+                            formula = timeId~tsId,
+                            value.var = "idDayType")
+
+fwrite(all_days_reporting, output_path)
+
+```
